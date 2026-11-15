@@ -1,0 +1,18 @@
+# Python environments and generated files (keep autoquiz.spec as build source).
+.venv/
+venv/
+build/
+dist/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Local browser sessions, course logs, and credentials.
+.edge-debug-profile/
+edge-profile/
+logs/
+reference_screenshots/
+*.log
+.env
+.env.*
+!.env.example

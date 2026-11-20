@@ -17,7 +17,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(ensure_debug_edge(), "connected")
         popen.assert_not_called()
 
-    def test_launch_uses_separate_profile_and_edge_new_tab(self) -> None:
+    def test_launch_uses_separate_profile_and_requested_homepage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             data_dir = Path(temporary_directory)
             with (
@@ -27,13 +27,13 @@ class RuntimeTests(unittest.TestCase):
                 patch("autoquiz.runtime.is_frozen", return_value=True),
                 patch("autoquiz.runtime.subprocess.Popen") as popen,
             ):
-                self.assertEqual(ensure_debug_edge(), "launched")
+                self.assertEqual(ensure_debug_edge(start_url="https://v8.chaoxing.com/"), "launched")
 
             arguments = popen.call_args.args[0]
             self.assertIn("--remote-debugging-port=9222", arguments)
             self.assertIn(f"--user-data-dir={data_dir / 'edge-profile'}", arguments)
             self.assertIn("--no-first-run", arguments)
-            self.assertEqual(arguments[-1], "edge://newtab")
+            self.assertEqual(arguments[-1], "https://v8.chaoxing.com/")
             self.assertFalse(any("baidu" in argument.lower() for argument in arguments))
 
 

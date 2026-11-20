@@ -65,7 +65,7 @@ def debug_endpoint_ready(cdp_url: str) -> bool:
         return False
 
 
-def ensure_debug_edge(cdp_url: str = "http://127.0.0.1:9222") -> str:
+def ensure_debug_edge(cdp_url: str = "http://127.0.0.1:9222", *, start_url: str | None = None) -> str:
     """启动软件专用 Edge；已存在可用调试端点时直接复用。"""
     if debug_endpoint_ready(cdp_url):
         return "connected"
@@ -85,7 +85,7 @@ def ensure_debug_edge(cdp_url: str = "http://127.0.0.1:9222") -> str:
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-search-engine-choice-screen",
-                "edge://newtab",
+                start_url or "edge://newtab",
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

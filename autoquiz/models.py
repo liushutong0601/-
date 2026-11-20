@@ -43,11 +43,18 @@ class Question:
     raw_type: str = ""
     screenshot_b64: str = ""
     screenshot_error: str = ""
+    retry_context: str = ""
+    image_input: bool = False
+    visual_context: str = ""
+    required_choices: int | None = None
+    excluded_answers: tuple[str, ...] = ()
+    memory_identity: tuple[str, ...] = ()
 
     @property
     def supported(self) -> bool:
         has_readable_content = bool(self.stem or self.screenshot_b64) and not self.screenshot_error
-        return self.kind.supported and not self.has_images and has_readable_content and bool(self.options)
+        images_ready = not self.has_images or bool(self.image_input and self.screenshot_b64)
+        return self.kind.supported and images_ready and has_readable_content and bool(self.options)
 
     @property
     def option_letters(self) -> set[str]:
@@ -141,9 +148,16 @@ class RunStats:
 
 
 def question_to_dict(question: Question) -> dict[str, Any]:
-    return {
+    result = {
         "number": question.number,
         "type": question.kind.value,
         "stem": question.stem,
         "options": {option.letter: option.text for option in question.options},
     }
+    if question.retry_context:
+        result["previous_attempt_feedback"] = question.retry_context
+    if question.required_choices is not None:
+        result["required_choices"] = question.required_choices
+    if question.excluded_answers:
+        result["excluded_answers"] = list(question.excluded_answers)
+    return result

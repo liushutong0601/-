@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from threading import Event
 from unittest.mock import Mock, patch
 
 from autoquiz.answers import normalize_answer, validate_answers
-from autoquiz.kimi import DeepSeekSolver, KimiSolver
+from autoquiz.browser import BrowserStopped
+from autoquiz.kimi import DeepSeekSolver, KimiSolver, SolverError
 from autoquiz.models import QuestionType
 from autoquiz.parser import parse_quiz
 
@@ -171,6 +173,53 @@ class AnswerTests(unittest.TestCase):
         self.quiz.questions[0].screenshot_b64 = "ZmFrZS1wbmc="
         content = DeepSeekSolver._message_content([self.quiz.questions[0]])
         self.assertIn("data:image/png;base64,ZmFrZS1wbmc=", str(content))
+
+    def test_deepseek_retries_same_request_on_connection_error(self) -> None:
+        from openai import APIConnectionError
+
+        solver = DeepSeekSolver(api_key="sk-test")
+        client = Mock()
+        response = Mock()
+        response.choices = [Mock()]
+        response.choices[0].message.content = '{"answers":[{"number":1,"answer":"A"}]}'
+        request = client.chat.completions.create
+        request.side_effect = [APIConnectionError(request=Mock()), response]
+        with patch.object(solver, '_client', return_value=client), patch('autoquiz.kimi.time.sleep') as sleep:
+            self.assertEqual(solver._request([self.quiz.questions[0]]), {1: 'A'})
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args_list[0], request.call_args_list[1])
+        sleep.assert_called_once_with(2)
+        client.close.assert_called_once()
+
+    def test_connection_retry_has_limit_and_hides_proxy_error_details(self) -> None:
+        from openai import APIConnectionError
+
+        logs = []
+        solver = DeepSeekSolver(api_key="sk-test", logger=logs.append)
+        client = Mock()
+        failure = APIConnectionError(request=Mock())
+        failure.__cause__ = RuntimeError('ProxyError: http://mock-user:private-token@127.0.0.1')
+        request = client.chat.completions.create
+        request.side_effect = failure
+        with patch.object(solver, '_client', return_value=client), patch('autoquiz.kimi.time.sleep') as sleep:
+            with self.assertRaisesRegex(SolverError, '代理连接失败') as error:
+                solver._request([self.quiz.questions[0]])
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4])
+        self.assertNotIn('private-token', ' '.join([*logs, str(error.exception)]))
+
+    def test_stop_during_connection_backoff_prevents_retry(self) -> None:
+        from openai import APIConnectionError
+
+        stop_event = Event()
+        solver = DeepSeekSolver(api_key="sk-test", stop_event=stop_event, logger=lambda _: stop_event.set())
+        client = Mock()
+        request = client.chat.completions.create
+        request.side_effect = APIConnectionError(request=Mock())
+        with patch.object(solver, '_client', return_value=client):
+            with self.assertRaises(BrowserStopped):
+                solver._request([self.quiz.questions[0]])
+        request.assert_called_once()
 
     def test_non_ascii_api_key_has_clear_error(self) -> None:
         with self.assertRaisesRegex(Exception, "含有中文"):

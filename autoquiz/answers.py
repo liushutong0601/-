@@ -24,7 +24,9 @@ def normalize_answer(question: Question, value: object) -> str | None:
             for option in question.options
             if any(keyword in option.text for keyword in keywords)
         ]
-        return matches[0] if len(matches) == 1 else None
+        if len(matches) != 1:
+            return None
+        text = matches[0]
 
     letters = re.findall(r"[A-Z]", text)
     if not letters:
@@ -38,8 +40,11 @@ def normalize_answer(question: Question, value: object) -> str | None:
             return None
     elif question.kind.value == "多选题" and not unique:
         return None
+    if question.required_choices is not None and len(unique) != question.required_choices:
+        return None
 
-    return "".join(option.letter for option in question.options if option.letter in unique)
+    normalized = "".join(option.letter for option in question.options if option.letter in unique)
+    return None if normalized in question.excluded_answers else normalized
 
 
 def validate_answers(quiz: Quiz, answers: Mapping[int, str]) -> tuple[dict[int, str], list[str]]:

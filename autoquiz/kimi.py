@@ -5,8 +5,11 @@ import os
 import re
 import time
 from collections.abc import Callable
+from contextlib import closing
+from threading import Event
 
 from .answers import normalize_answer
+from .browser import BrowserStopped
 from .models import Question, Quiz, question_to_dict
 
 
@@ -21,16 +24,19 @@ class AISolver:
     env_var = ""
     request_interval = 0.0
     max_rate_limit_retries = 4
+    max_connection_retries = 2
 
     def __init__(
         self,
         api_key: str | None = None,
         model: str | None = None,
         logger: Callable[[str], None] | None = None,
+        stop_event: Event | None = None,
     ) -> None:
         self.api_key = (api_key or os.environ.get(self.env_var) or "").strip()
         self.model = (model or "").strip() or self.default_model
         self.logger = logger or (lambda _message: None)
+        self.stop_event = stop_event
         self._last_request_started = 0.0
         if not self.api_key:
             raise SolverError(
@@ -45,6 +51,10 @@ class AISolver:
     def _client(self):
         try:
             from openai import OpenAI
+            try:
+                from openai import Timeout
+            except ImportError:
+                from httpx import Timeout  # 较旧的 SDK 使用 httpx 提供的 Timeout。
         except ImportError as exc:
             raise SolverError(
                 "缺少 openai 运行组件。源码运行请安装 requirements.txt；"
@@ -53,7 +63,8 @@ class AISolver:
         return OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
-            timeout=120.0,
+            timeout=Timeout(120.0, connect=10.0),
+            max_retries=0,  # 重试由答题器统一记录和取消。
         )
 
     @staticmethod
@@ -63,6 +74,9 @@ class AISolver:
             "格式：{\"answers\":[{\"number\":题号,\"answer\":\"选项字母\"}]}。\n"
             "单选题和判断题只能返回一个字母；多选题返回全部应选字母，例如 AC；"
             "不得返回题目中不存在的选项。无法确定时 answer 返回空字符串。"
+            "excluded_answers 是本轮禁止返回的完整字母组合，不能重复；"
+            "多选题被排除的完整组合不表示其中每个选项都错。"
+            "答案 number 必须使用消息标注的题号，不使用截图中的原网页编号。"
         )
 
     @classmethod
@@ -79,7 +93,12 @@ class AISolver:
             if question.screenshot_b64:
                 content.append({
                     "type": "text",
-                    "text": f"第 {question.number} 题，{question.kind.value}。读取紧随其后的题目截图并作答。",
+                    "text": (
+                        f"第 {question.number} 题，{question.kind.value}。读取紧随其后的题目截图并作答。"
+                        + ("\n" + question.visual_context if question.visual_context else "")
+                        + '\n' + json.dumps({k:v for k,v in question_to_dict(question).items()
+                            if k in {'number','previous_attempt_feedback','excluded_answers','required_choices'}},ensure_ascii=False)
+                    ),
                 })
                 content.append({
                     "type": "image_url",
@@ -96,12 +115,41 @@ class AISolver:
         return {}
 
     def _wait_for_request_slot(self) -> None:
+        self._wait(0)
         if self.request_interval > 0 and self._last_request_started > 0:
             remaining = self.request_interval - (time.monotonic() - self._last_request_started)
             if remaining > 0:
                 self.logger(f"为遵守 {self.display_name} 请求频率限制，等待 {remaining:.0f} 秒……")
-                time.sleep(remaining)
+                self._wait(remaining)
         self._last_request_started = time.monotonic()
+
+    def _wait(self, seconds: float) -> None:
+        if self.stop_event is not None:
+            if self.stop_event.wait(seconds):
+                raise BrowserStopped("已按用户要求停止。")
+        elif seconds > 0:
+            time.sleep(seconds)
+
+    @staticmethod
+    def _connection_detail(error: BaseException) -> str:
+        causes = []
+        for _ in range(8):
+            if error is None or error in causes:
+                break
+            causes.append(error)
+            error = error.__cause__ or error.__context__
+        details = ' '.join(f'{type(cause).__name__} {cause}' for cause in causes).lower()
+        if 'certificate_verify_failed' in details or 'certificate verify failed' in details:
+            return 'TLS 证书校验失败'
+        if any(token in details for token in ('getaddrinfo', 'name resolution', 'gaierror', 'name or service not known')):
+            return 'DNS 解析失败'
+        if 'proxyerror' in details or 'proxy error' in details:
+            return '代理连接失败'
+        if 'timeout' in details or 'timed out' in details:
+            return 'API 请求超时'
+        if 'connection refused' in details or 'actively refused' in details or '10061' in details:
+            return '连接被拒绝'
+        return '连接中断或无法建立'
 
     @staticmethod
     def _rate_limit_delay(error: str, retry_index: int) -> float:
@@ -113,10 +161,17 @@ class AISolver:
         return max(server_delay, backoff)
 
     def _request(self, questions: list[Question]) -> dict[int, str]:
-        for attempt in range(self.max_rate_limit_retries + 1):
+        with closing(self._client()) as client:
+            return self._request_with_retry(client, questions)
+
+    def _request_with_retry(self, client, questions: list[Question]) -> dict[int, str]:
+        from openai import APIConnectionError
+
+        rate_retries = connection_retries = 0
+        while True:
             self._wait_for_request_slot()
             try:
-                response = self._client().chat.completions.create(
+                response = client.chat.completions.create(
                     model=self.model,
                     messages=[
                         {
@@ -127,27 +182,39 @@ class AISolver:
                     ],
                     **self._request_options(),
                 )
-                content = response.choices[0].message.content or ""
-                return self._parse_response(content, questions)
             except Exception as exc:
-                error = str(exc)
+                self._wait(0)
+                error = str(exc).replace(self.api_key, '[已隐藏]')
+                status = getattr(exc, 'status_code', None)
+                if isinstance(exc, APIConnectionError) or status in {408, 409} or (
+                        isinstance(status, int) and 500 <= status < 600):
+                    detail = self._connection_detail(exc) if isinstance(exc, APIConnectionError) else f'服务返回 HTTP {status}'
+                    message = f"{self.display_name} API 连接失败（{detail}）。"
+                    if detail == 'TLS 证书校验失败' or connection_retries >= self.max_connection_retries:
+                        raise SolverError(message) from exc
+                    connection_retries += 1
+                    delay = 2 ** connection_retries
+                    self.logger(f"{message} {delay} 秒后重试当前 API 请求（{connection_retries}/{self.max_connection_retries}）……")
+                    self._wait(delay)
+                    continue
                 is_rate_limited = (
-                    "429" in error
-                    or "rate_limit" in error.lower()
-                    or "max rpm" in error.lower()
+                    status == 429 or (status is None and (
+                        "Error code: 429" in error or "rate_limit" in error.lower() or "max rpm" in error.lower()
+                    ))
                 )
                 if is_rate_limited:
-                    if attempt >= self.max_rate_limit_retries:
+                    if rate_retries >= self.max_rate_limit_retries:
                         raise SolverError(
                             f"{self.display_name} API 请求频率持续受限，"
                             f"自动重试 {self.max_rate_limit_retries} 次后仍失败：{error}"
                         ) from exc
-                    delay = self._rate_limit_delay(error, attempt)
+                    delay = self._rate_limit_delay(error, rate_retries)
+                    rate_retries += 1
                     self.logger(
                         f"{self.display_name} 请求达到频率上限，{delay:.0f} 秒后自动重试"
-                        f"（{attempt + 1}/{self.max_rate_limit_retries}）……"
+                        f"（{rate_retries}/{self.max_rate_limit_retries}）……"
                     )
-                    time.sleep(delay)
+                    self._wait(delay)
                     continue
                 if "404" in error and ("Not found the model" in error or "Permission denied" in error):
                     raise SolverError(
@@ -155,8 +222,10 @@ class AISolver:
                         "请使用官方可用模型；Kimi 默认使用 kimi-k2.6。"
                         f"原始错误：{error}"
                     ) from exc
-                raise SolverError(f"{self.display_name} API 调用失败：{exc}") from exc
-        raise SolverError(f"{self.display_name} API 请求未能完成。")
+                raise SolverError(f"{self.display_name} API 调用失败：{error}") from exc
+            self._wait(0)
+            content = response.choices[0].message.content or ""
+            return self._parse_response(content, questions)
 
     @staticmethod
     def _parse_response(content: str, questions: list[Question]) -> dict[int, str]:

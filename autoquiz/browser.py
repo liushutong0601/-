@@ -359,10 +359,7 @@ class EdgeBrowser:
             pages = [page for context in self.browser.contexts for page in context.pages]
             if not pages:
                 raise BrowserError("调试 Edge 中没有可用标签页。")
-            self.page = next(
-                (page for page in pages if "chaoxing.com" in page.url and "studentstudy" in page.url),
-                next((page for page in pages if "chaoxing.com" in page.url), pages[-1]),
-            )
+            self.page = self._select_page(pages)
             self._track_page_requests()
             self.page.bring_to_front()
         except Exception as exc:
@@ -370,8 +367,14 @@ class EdgeBrowser:
             if isinstance(exc, BrowserError):
                 raise
             raise BrowserError(
-                "无法连接 Edge。请使用项目中的“启动调试Edge.bat”打开浏览器并登录学习通。"
+                "无法连接 Edge。请在软件中点击“启动专用浏览器”，在新窗口登录所选平台并打开课程。"
             ) from exc
+
+    def _select_page(self, pages):
+        return next(
+            (page for page in pages if "chaoxing.com" in page.url and "studentstudy" in page.url),
+            next((page for page in pages if "chaoxing.com" in page.url), pages[-1]),
+        )
 
     def close(self) -> None:
         try:
@@ -400,6 +403,19 @@ class EdgeBrowser:
     def page_info(self) -> dict[str, str]:
         page = self._require_page()
         return {"title": page.title(), "url": page.url}
+
+    def open_homepage(self, url: str) -> None:
+        """打开或聚焦平台首页，保留专用浏览器中已有的课程页面。"""
+        self._check_stopped()
+        context = self._require_page().context
+        homepage = next((page for page in context.pages if page.url.rstrip('/') == url.rstrip('/')), None)
+        if homepage is None:
+            homepage = context.new_page()
+            self._check_stopped()
+            homepage.bring_to_front()
+            homepage.goto(url, wait_until="commit", timeout=15000)
+        else:
+            homepage.bring_to_front()
 
     def current_chapter_key(self) -> str:
         """目录切换通常先于地址栏更新，去重时使用当前目录项规范化 chapterId。"""

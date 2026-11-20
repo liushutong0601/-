@@ -18,7 +18,7 @@ def check_runtime_dependencies() -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="学习通章节测验自动答题")
+    parser = argparse.ArgumentParser(description="自动搜题课程助手")
     parser.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--dependency-check", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args()
